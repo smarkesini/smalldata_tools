@@ -10,6 +10,12 @@ from smalldata_tools.DetObjectFunc import DetObjectFunc
 from smalldata_tools.DetObjectFunc import event
 from future.utils import iteritems
 from mpi4py import MPI
+
+from timeit import default_timer as timer
+from compress_and_decompress import compress_and_decompress
+
+
+
 rank = MPI.COMM_WORLD.Get_rank()
 try:
     basestring
@@ -21,7 +27,7 @@ from read_uxi import read_uxi, get_uxi_timestamps, getDarks
 
 import Detector as DetTypes
 import psana
-#from collections import Counter
+
 
 def DetObject(srcName, env, run, **kwargs):
     print('Getting the detector for: ',srcName)
@@ -269,7 +275,7 @@ class DetObjectClass(object):
                 print('Could not run function %s on data of detector %s of shape'%(func._name, self._name), self.evt.dat.shape)
                 print('Error message: {}'.format(E))
 
-    def processSums(self, **kwargs):
+    def processSums(self):
         for key in self._storeSum.keys():
             asImg=False
             thres=-1.e9
@@ -298,13 +304,6 @@ class DetObjectClass(object):
                 except:
                     pass
 
-            #loop over kwargs & look for them in the key
-            for k,v in kwargs.items():
-                # the key indicates a given selection is to be respected
-                if key.find(k)>=0:
-                    # is the selection is not tryue, set array to zeros
-                    if not v: dat_to_be_summed = np.zeros_like(dat_to_be_summed)
-            
             if self._storeSum[key] is None:
                 self._storeSum[key] = dat_to_be_summed.copy()
             else:
@@ -632,6 +631,9 @@ class TiledCameraObject(CameraObject):
                 self.areas = self.det.areas(run)
             except:
                 pass
+        self.method = kwargs.get('method') # compression pre-transform
+        self.AbsCError = kwargs.get('AbsCError') # max absolute compression error
+
 
     def getData(self, evt):
         super(TiledCameraObject, self).getData(evt)
@@ -824,9 +826,16 @@ class EpixObject(TiledCameraObject):
         #super().__init__(det,env,run, **kwargs)
         super(EpixObject, self).__init__(det,env,run, **kwargs)
         self._common_mode_list = [6, 36, 4, 34, 45, 46, 47, 0,-1, 30] # Jacob (norm), Jacob, def, def(ami-like), mine, mine (norm), mine (norm-bank), none, raw, calib
+
+#        self._common_mode_list = [6, 36, 4, 34, 45, 46, 47, 0,-1, 30] # Jacob (norm), Jacob, def, def(ami-like), mine, mine (norm), mine (norm-bank), none, raw, calib
+
         self.common_mode = kwargs.get('common_mode', self._common_mode_list[0])
         if self.common_mode is None:
             self.common_mode = self._common_mode_list[0]
+
+        #if self.common_mode == 80:
+            
+
         if self.common_mode not in self._common_mode_list:
             print('Common mode %d is not an option for as Epix detector, please choose from: '%self.common_mode, self._common_mode_list)
         self.pixelsize=[50e-6]
@@ -1073,11 +1082,15 @@ class Epix10k2MObject(TiledCameraObject):
     def __init__(self, det, env, run, **kwargs):
         #super().__init__(det,env,run, **kwargs)
         super(Epix10k2MObject, self).__init__(det,env,run, **kwargs)
+#        self._common_mode_list = [80, 84, 81, 82, 85, 180, 181, 0, -1, -2, 30, 90] # official, sn kludge, ped sub, raw, calib
         self._common_mode_list = [80, 84, 81, 82, 85, 180, 181, 0, -1, -2, 30] # official, sn kludge, ped sub, raw, calib
         self.common_mode = kwargs.get('common_mode', self._common_mode_list[0])
+        self.method    = kwargs.get('method')
+        self.AbsCError = kwargs.get('AbsCError')
+
         if self.common_mode is None:
             self.common_mode = self._common_mode_list[0]
-        if self.common_mode not in self._common_mode_list:
+        if int(self.common_mode) not in self._common_mode_list:
             print('Common mode %d is not an option for as Epix detector, please choose from: '%self.common_mode, self._common_mode_list)
         self.pixelsize=[100e-6]
         self.isGainswitching=True
@@ -1154,9 +1167,14 @@ class Epix10k2MObject(TiledCameraObject):
             self.mask = (ghostmask&self.mask)
 
     def getData(self, evt):
+        # raise NameError('HiThere')
+
         super(Epix10k2MObject, self).getData(evt)
         mbits=0 #do not apply mask (would set pixels to zero)
         #mbits=1 #set bad pixels to 0
+
+        print('common mode',self.common_mode, self.common_mode<0)
+
         if self.common_mode<0:
           if self.common_mode==-2:
             self.evt.dat = self.evt.dat
@@ -1186,6 +1204,25 @@ class Epix10k2MObject(TiledCameraObject):
             evt_dat = self.det.calib(evt, cmpars=(7,0,100))
             self.evt.dat = np.empty(evt_dat.shape, dtype=np.float32) #can't reember why I'm doing this. I think for the data type.
             self.evt.dat[:,:,:] = evt_dat[:,:,:]
+
+        elif int(self.common_mode%100)==90: #compression/decompression 
+            evt_dat = self.det.calib(evt, cmpars=(7,0,100))
+            evt_dat_cp = evt_dat
+
+            # raise NameError('HiThere')
+            abs_error = self.AbsCError 
+            #abs_error = (self.common_mode%100 - 90)*10000
+            if rank == 0 and Verbose == 1:
+              print(f'compression E {abs_error}', file=open('output.log', 'a'))
+
+            evt_dat_cp = compress_and_decompress(evt_dat, abs_error, method = self.method )
+
+            self.evt.dat = np.empty(evt_dat.shape, dtype=np.float32) #can't reember why I'm doing this. I think for the data type.
+            #self.evt.dat[:,:,:] = evt_dat[:,:,:]
+
+            self.evt.dat[:,:,:] = evt_dat_cp[:,:,:]
+            
+
         elif self.common_mode%100==84: #rows 
             evt_dat = self.det.calib(evt, cmpars=(7,2,10,10))
             self.evt.dat = np.empty(evt_dat.shape, dtype=np.float32) 
