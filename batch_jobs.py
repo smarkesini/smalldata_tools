@@ -3,7 +3,7 @@ import argparse
 import os
 
 parser = argparse.ArgumentParser()
-
+ 
 
 parser.add_argument("--directory", type = str, help="directory to write output, I will add exp to it", default='/reg/data/ana03/scratch/smarches/tvdc/data')
 parser.add_argument("--test", type = int, help="0 prints the command, 1 will execute", default=1)
