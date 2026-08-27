@@ -166,7 +166,6 @@ class azimuthalBinning_gpu(azimuthalBinning):
             "gain", self.gainImg, lambda a: cp.asarray(a, dtype=cp.float64)
         )
 
-
     @staticmethod
     def _to_dev_f64(a):
         """Upload in the array's NATIVE dtype, then cast ON THE DEVICE.
