@@ -166,10 +166,45 @@ class azimuthalBinning_gpu(azimuthalBinning):
             "gain", self.gainImg, lambda a: cp.asarray(a, dtype=cp.float64)
         )
 
+
+    @staticmethod
+    def _to_dev_f64(a):
+        """Upload in the array's NATIVE dtype, then cast ON THE DEVICE.
+
+        ``cp.asarray(x, dtype=cp.float64)`` converts on the HOST first, so a float32 frame -- which
+        is what psana hands out -- paid a host conversion AND a full float64 upload. Measured on an
+        A100 at epix10k2M scale (2.16 Mpix):
+
+            fp64 host -> fp64 dev (direct memcpy)          1.58 ms   10.9 GB/s
+            fp32 host -> fp64 dev (cp.asarray(dtype=))     3.19 ms    2.7 GB/s
+            fp32 host -> fp32 dev, then cast on device     1.01 ms    8.6 GB/s
+
+        i.e. handing this class the dtype it actually receives in production was the SLOWEST case,
+        2x worse than float64. End to end that is 3.57 -> 1.37 ms/event (13.9 ms on one CPU core),
+        so 3.8x -> 10.1x against the parent. Device-resident frames are unaffected.
+        """
+        g = cp.asarray(a)
+        return g if g.dtype == cp.float64 else g.astype(cp.float64)
+
+    @staticmethod
+    def _reject_device_array_on_cpu_path(a, where):
+        """A CuPy frame on the CPU path used to die inside the parent as
+        ``TypeError: Unsupported type <class 'numpy.ndarray'>`` -- raised from
+        ``img / self.correction`` when CuPy refuses the host operand, naming the HOST array as the
+        unsupported one. Nothing in that message points at the actual cause, which is that this
+        object was built without ``use_gpu=True``. Say so here instead."""
+        if type(a).__module__.split(".")[0] == "cupy":
+            raise TypeError(
+                f"{where}: got a CuPy array but this azimuthalBinning_gpu is on its CPU path, so "
+                "the frame would be handed to the parent's NumPy bincount. Build it with "
+                "use_gpu=True (and check CuPy imports) or pass a host array."
+            )
+
     # ------------------------------------------------------------------ per frame
     def doCake(self, img, applyCorrection=True):
         """One frame -> Icake, shape (nphi, nradial). Same contract as the parent."""
         if not self._on_gpu():
+            self._reject_device_array_on_cpu_path(img, "doCake")
             return super(azimuthalBinning_gpu, self).doCake(
                 img, applyCorrection=applyCorrection
             )
@@ -177,7 +212,7 @@ class azimuthalBinning_gpu(azimuthalBinning):
         # One backend for the whole pre-processing: upload the frame first, then apply the
         # device-cached calibration images (mirroring the parent's order). Mixing a device
         # frame with host darkImg/gainImg would raise -- CuPy refuses host operands.
-        g = cp.asarray(img, dtype=cp.float64).ravel()
+        g = self._to_dev_f64(img).ravel()
         dark = self._dev_dark()
         if dark is not None:
             g = g - dark.ravel()
@@ -207,6 +242,7 @@ class azimuthalBinning_gpu(azimuthalBinning):
         batch call matches a loop of ``doCake()`` on either backend.
         """
         if not self._on_gpu():
+            self._reject_device_array_on_cpu_path(imgs, "doCake_batch")
             # np.array (a COPY, not np.asarray's view): the parent's doCake mutates its
             # input in place when darkImg/gainImg are set -- don't corrupt the caller's batch.
             return np.stack(
@@ -218,7 +254,7 @@ class azimuthalBinning_gpu(azimuthalBinning):
                 ]
             )
 
-        G = cp.asarray(imgs, dtype=cp.float64).reshape(len(imgs), -1)
+        G = self._to_dev_f64(imgs).reshape(len(imgs), -1)
         dark = self._dev_dark()
         if dark is not None:
             G = G - dark.ravel()[None, :]

@@ -210,3 +210,45 @@ def test_parent_rbin_path_is_broken_upstream():
     assert ref.nr != ref.nq, "test geometry no longer exercises the mismatch"
     with pytest.raises(ValueError, match="reshape"):
         ref.doCake(_frames(1)[0])
+
+
+@pytest.mark.skipif(not _HAS_GPU, reason="CuPy/GPU not available")
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.int32])
+def test_upload_is_dtype_independent(dtype):
+    """A float32 frame must give the float64 answer, and take the fast route getting there.
+
+    The class used to do ``cp.asarray(img, dtype=cp.float64)``, which converts on the HOST and then
+    uploads at float64 width -- so the dtype psana actually delivers (float32) was the SLOWEST
+    input, 2x worse than float64. Uploading native and casting on device is what fixed it; this
+    pins the RESULT, which is what a test can assert, and the docstring on _to_dev_f64 carries the
+    measurement.
+    """
+    import cupy
+
+    ref = _make(azimuthalBinning_gpu, phiBins=3, use_gpu=True)
+    # Round-trip through `dtype` FIRST so the reference is the same data: int32 truncates, and
+    # comparing truncated input against the untruncated float64 answer tests nothing about the
+    # upload path (it fails on the truncation, which is the caller's choice, not this code's).
+    img = _frames(1)[0].astype(dtype)
+    want = ref.doCake(img.astype(np.float64))
+    got = ref.doCake(cupy.asarray(img))
+    np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-9)
+    assert isinstance(got, np.ndarray)
+
+
+@pytest.mark.skipif(not _HAS_GPU, reason="CuPy/GPU not available")
+def test_device_frame_on_cpu_path_is_rejected_clearly():
+    """A CuPy frame with use_gpu unset used to die inside the PARENT as
+    ``TypeError: Unsupported type <class 'numpy.ndarray'>`` -- raised from ``img / self.correction``
+    when CuPy refused the host operand, and naming the host array as the unsupported one. Nothing
+    in that pointed at the real cause (the object is on its CPU path), which is how the benchmark
+    that found the upload defect went wrong first.
+    """
+    import cupy
+
+    f = _make(azimuthalBinning_gpu, phiBins=1)  # use_gpu defaults to False
+    img = cupy.asarray(_frames(1)[0])
+    with pytest.raises(TypeError, match="use_gpu=True"):
+        f.doCake(img)
+    with pytest.raises(TypeError, match="use_gpu=True"):
+        f.doCake_batch(cupy.asarray(_frames(2)))
